@@ -28,7 +28,7 @@ jobs:
           username: ${{ secrets.FTP_USERNAME }}
           password: ${{ secrets.FTP_PASSWORD }}
           local-dir: ./
-          server-dir: /htdocs/
+          server-dir: /mathrabbit.totalh.net/htdocs/
           exclude: |
             **/.git*
             **/.git*/**
