@@ -39,9 +39,10 @@ const escapeHtml = (value) => String(value).replace(/[&<>"']/g, (character) => (
     "'": '&#39;',
 }[character]));
 
-async function request(action, data = null) {
+async function request(action, data = null, retryCsrf = true) {
     const options = {
         method: data === null ? 'GET' : 'POST',
+        credentials: 'same-origin',
         headers: { Accept: 'application/json' },
     };
     if (data !== null) {
@@ -55,6 +56,19 @@ async function request(action, data = null) {
         payload = await response.json();
     } catch {
         throw new Error('Não foi possível entender a resposta do servidor. Tente novamente.');
+    }
+    const csrfExpired = payload.error === 'Sua sessão expirou. Atualize a página e tente novamente.';
+    if ((response.status === 419 || csrfExpired) && data !== null && retryCsrf) {
+        const bootstrapResponse = await fetch('api.php?action=bootstrap', {
+            credentials: 'same-origin',
+            headers: { Accept: 'application/json' },
+        });
+        const bootstrap = await bootstrapResponse.json();
+        if (!bootstrapResponse.ok || typeof bootstrap.csrf !== 'string' || bootstrap.csrf === '') {
+            throw new Error('Sua sessão expirou. Atualize a página e tente novamente.');
+        }
+        state.csrf = bootstrap.csrf;
+        return request(action, data, false);
     }
     if (!response.ok) {
         throw new Error(payload.error || 'Não foi possível concluir esta ação.');

@@ -11,7 +11,7 @@ header('Cache-Control: no-cache, must-revalidate');
     <title>MathRabbit — aprender pode ser uma aventura</title>
     <link rel="icon" type="image/svg+xml" href="mathrabbit-logo.svg?v=20261009-19">
     <link rel="stylesheet" href="styles.css?v=20261023-1">
-    <script src="app.js?v=20261023-1" defer></script>
+    <script src="app.js?v=20261023-3" defer></script>
 </head>
 <body>
     <div class="ambient ambient-one" aria-hidden="true"></div>

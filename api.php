@@ -1,13 +1,48 @@
 <?php
 declare(strict_types=1);
 
+const SESSION_LIFETIME = 30 * 24 * 60 * 60;
+
+ini_set('session.gc_maxlifetime', (string) SESSION_LIFETIME);
 session_name('mathplay_session');
 session_set_cookie_params([
+    'lifetime' => SESSION_LIFETIME,
+    'path' => '/',
     'httponly' => true,
     'secure' => !empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off',
     'samesite' => 'Lax',
 ]);
 session_start();
+
+function logSessionEvent(string $event, array $details = []): void
+{
+    $logPath = __DIR__ . DIRECTORY_SEPARATOR . 'data' . DIRECTORY_SEPARATOR . 'session.log';
+    $entry = [
+        'timestamp' => gmdate('Y-m-d\TH:i:s\Z'),
+        'event' => $event,
+        'action' => substr((string) ($_GET['action'] ?? 'unknown'), 0, 80),
+        'method' => (string) ($_SERVER['REQUEST_METHOD'] ?? 'unknown'),
+        'session_cookie_present' => isset($_COOKIE[session_name()]),
+        'authenticated' => isset($_SESSION['user_id']),
+        'details' => $details,
+    ];
+    $line = json_encode($entry, JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE);
+    if ($line === false || file_put_contents($logPath, $line . PHP_EOL, FILE_APPEND | LOCK_EX) === false) {
+        error_log('MathRabbit: não foi possível gravar o log de sessão em ' . $logPath);
+    }
+}
+
+$previousActivity = $_SESSION['last_activity_at'] ?? null;
+$action = substr((string) ($_GET['action'] ?? 'unknown'), 0, 80);
+if ($action === 'bootstrap') {
+    logSessionEvent('bootstrap', [
+        'csrf_token_present' => isset($_SESSION['csrf']),
+        'idle_seconds' => is_int($previousActivity) ? max(0, time() - $previousActivity) : null,
+        'cookie_lifetime_seconds' => (int) ini_get('session.cookie_lifetime'),
+        'gc_maxlifetime_seconds' => (int) ini_get('session.gc_maxlifetime'),
+    ]);
+}
+$_SESSION['last_activity_at'] = time();
 
 header('Content-Type: application/json; charset=utf-8');
 header('X-Content-Type-Options: nosniff');
@@ -15,6 +50,9 @@ header('Cache-Control: no-store');
 
 function respond(array $data, int $status = 200): never
 {
+    if ($status >= 400) {
+        logSessionEvent('response_error', ['status' => $status]);
+    }
     http_response_code($status);
     echo json_encode($data, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
     exit;
@@ -27,121 +65,8 @@ function database(): PDO
         return $pdo;
     }
 
-    $configuredDirectory = getenv('MATHPLAY_DATA_DIR');
-    $directory = $configuredDirectory !== false && $configuredDirectory !== ''
-        ? $configuredDirectory
-        : dirname(__DIR__, 2) . DIRECTORY_SEPARATOR . 'mathplay-solutions-data';
-    if (!is_dir($directory) && !mkdir($directory, 0775, true) && !is_dir($directory)) {
-        throw new RuntimeException('Não foi possível criar a pasta do banco de dados.');
-    }
-
-    $pdo = new PDO('sqlite:' . $directory . DIRECTORY_SEPARATOR . 'mathplay.sqlite', options: [
-        PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
-        PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
-    ]);
-    $pdo->exec('PRAGMA foreign_keys = ON');
-    $pdo->exec('PRAGMA journal_mode = WAL');
-    $pdo->exec("
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            email TEXT NOT NULL COLLATE NOCASE UNIQUE,
-            password_hash TEXT NOT NULL,
-            role TEXT NOT NULL CHECK (role IN ('student', 'teacher')),
-            accessibility_enabled INTEGER NOT NULL DEFAULT 0 CHECK (accessibility_enabled IN (0, 1)),
-            font_size TEXT NOT NULL DEFAULT 'normal' CHECK (font_size IN ('small', 'normal', 'large')),
-            coins INTEGER NOT NULL DEFAULT 30,
-            total_points INTEGER NOT NULL DEFAULT 0,
-            pet_name TEXT NOT NULL DEFAULT '',
-            energy INTEGER NOT NULL DEFAULT 100 CHECK (energy BETWEEN 0 AND 100),
-            last_decay_time TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            unlocked_characters TEXT NOT NULL DEFAULT '[\"rabbit\"]',
-            active_character TEXT NOT NULL DEFAULT 'rabbit',
-            affection_count INTEGER NOT NULL DEFAULT 0,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-        );
-        CREATE TABLE IF NOT EXISTS game_runs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-            game_key TEXT NOT NULL,
-            difficulty TEXT NOT NULL CHECK (difficulty IN ('easy', 'medium', 'hard')),
-            score INTEGER NOT NULL DEFAULT 0,
-            correct_count INTEGER NOT NULL DEFAULT 0,
-            total_questions INTEGER NOT NULL DEFAULT 0,
-            status TEXT NOT NULL DEFAULT 'in_progress' CHECK (status IN ('in_progress', 'completed')),
-            started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            completed_at TEXT
-        );
-        CREATE TABLE IF NOT EXISTS answers (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            run_id INTEGER NOT NULL REFERENCES game_runs(id) ON DELETE CASCADE,
-            question_text TEXT NOT NULL,
-            expected_answer TEXT NOT NULL,
-            submitted_answer TEXT NOT NULL,
-            is_correct INTEGER NOT NULL CHECK (is_correct IN (0, 1)),
-            explanation TEXT NOT NULL,
-            answered_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-        );
-        CREATE TABLE IF NOT EXISTS achievements (
-            id TEXT PRIMARY KEY,
-            title TEXT NOT NULL,
-            description TEXT NOT NULL,
-            icon TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS user_achievements (
-            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-            achievement_id TEXT NOT NULL REFERENCES achievements(id) ON DELETE CASCADE,
-            unlocked_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            PRIMARY KEY (user_id, achievement_id)
-        );
-    ");
-
-    $userColumns = $pdo->query('PRAGMA table_info(users)')->fetchAll();
-    $existingUserColumns = array_column($userColumns, 'name');
-    $userColumnDefinitions = [
-        'pet_name' => "TEXT NOT NULL DEFAULT ''",
-        'energy' => 'INTEGER NOT NULL DEFAULT 100',
-        'last_decay_time' => "TEXT NOT NULL DEFAULT ''",
-        'unlocked_characters' => "TEXT NOT NULL DEFAULT '[\"rabbit\"]'",
-        'active_character' => "TEXT NOT NULL DEFAULT 'rabbit'",
-        'affection_count' => 'INTEGER NOT NULL DEFAULT 0',
-        'owned_companions' => "TEXT NOT NULL DEFAULT '[]'",
-        'equipped_companion_id' => 'TEXT',
-        'accessibility_enabled' => 'INTEGER NOT NULL DEFAULT 0',
-        'font_size' => "TEXT NOT NULL DEFAULT 'normal'",
-    ];
-    foreach ($userColumnDefinitions as $column => $definition) {
-        if (!in_array($column, $existingUserColumns, true)) {
-            $pdo->exec("ALTER TABLE users ADD COLUMN $column $definition");
-        }
-    }
-    $pdo->exec("UPDATE users SET last_decay_time = CURRENT_TIMESTAMP WHERE last_decay_time = ''");
-    $pdo->exec("
-        UPDATE users
-        SET unlocked_characters = '[\"rabbit\"]', active_character = 'rabbit'
-        WHERE unlocked_characters = '' OR unlocked_characters IS NULL
-    ");
-    foreach (['equipped_items', 'equipped_clothes'] as $legacyColumn) {
-        if (in_array($legacyColumn, $existingUserColumns, true)) {
-            $pdo->exec("ALTER TABLE users DROP COLUMN $legacyColumn");
-        }
-    }
-    foreach (['owned_pets', 'equipped_pet_id'] as $legacyColumn) {
-        if (in_array($legacyColumn, $existingUserColumns, true)) {
-            $pdo->exec("ALTER TABLE users DROP COLUMN $legacyColumn");
-        }
-    }
-    $pdo->exec('DROP TABLE IF EXISTS user_outfits');
-    $pdo->exec('DROP TABLE IF EXISTS outfits');
-    $pdo->exec('DROP TABLE IF EXISTS pet_companions');
-
-    $pdo->exec("
-        INSERT OR IGNORE INTO achievements (id, title, description, icon) VALUES
-            ('first_run', 'Primeira missão', 'Conclua sua primeira partida.', '🚀'),
-            ('perfect_run', 'Mente brilhante', 'Acerte todas as perguntas de uma fase.', '💎'),
-            ('ten_correct', 'Craque dos números', 'Acerte 10 perguntas no total.', '⭐');
-    ");
-
+    require_once __DIR__ . DIRECTORY_SEPARATOR . 'conexao.php';
+    $pdo = conectar();
     return $pdo;
 }
 
@@ -165,7 +90,12 @@ function requireMethod(string $method): void
 function requireCsrf(): void
 {
     $sent = $_SERVER['HTTP_X_CSRF_TOKEN'] ?? '';
-    if (!is_string($sent) || !hash_equals($_SESSION['csrf'] ?? '', $sent)) {
+    $stored = $_SESSION['csrf'] ?? '';
+    if (!is_string($sent) || !is_string($stored) || $stored === '' || !hash_equals($stored, $sent)) {
+        logSessionEvent('csrf_rejected', [
+            'sent_token_present' => is_string($sent) && $sent !== '',
+            'stored_token_present' => is_string($stored) && $stored !== '',
+        ]);
         respond(['error' => 'Sua sessão expirou. Atualize a página e tente novamente.'], 419);
     }
 }
@@ -174,6 +104,7 @@ function currentUser(PDO $pdo): array
 {
     $userId = $_SESSION['user_id'] ?? null;
     if (!is_int($userId)) {
+        logSessionEvent('authentication_missing');
         respond(['error' => 'Entre na sua conta para continuar.'], 401);
     }
     $statement = $pdo->prepare('
@@ -183,6 +114,7 @@ function currentUser(PDO $pdo): array
     $statement->execute([$userId]);
     $user = $statement->fetch();
     if (!$user) {
+        logSessionEvent('authenticated_user_not_found');
         session_destroy();
         respond(['error' => 'Sua conta não está mais disponível. Entre novamente.'], 401);
     }
@@ -367,7 +299,7 @@ function studentLeaderboard(PDO $pdo): array
                ranked.correct_answers, ranked.games_played
         FROM (
             SELECT ROW_NUMBER() OVER (
-                       ORDER BY u.total_points DESC, u.name COLLATE NOCASE ASC, u.id ASC
+                       ORDER BY u.total_points DESC, u.name COLLATE utf8mb4_unicode_ci ASC, u.id ASC
                    ) AS position,
                    u.id, u.name, u.total_points,
                    COALESCE(SUM(CASE WHEN r.status = 'completed' THEN r.correct_count ELSE 0 END), 0) AS correct_answers,
@@ -385,7 +317,7 @@ function studentLeaderboard(PDO $pdo): array
 
 function unlockAchievement(PDO $pdo, int $userId, string $achievementId): void
 {
-    $statement = $pdo->prepare('INSERT OR IGNORE INTO user_achievements (user_id, achievement_id) VALUES (?, ?)');
+    $statement = $pdo->prepare('INSERT IGNORE INTO user_achievements (user_id, achievement_id) VALUES (?, ?)');
     $statement->execute([$userId, $achievementId]);
 }
 
@@ -989,7 +921,7 @@ try {
                 $accessibilityEnabled ? 'large' : 'normal',
             ]);
         } catch (PDOException $exception) {
-            if (str_contains($exception->getMessage(), 'UNIQUE constraint failed')) {
+            if (($exception->errorInfo[1] ?? null) === 1062) {
                 respond(['error' => 'Já existe uma conta com este e-mail.'], 409);
             }
             throw $exception;
@@ -997,6 +929,7 @@ try {
         $userId = (int) $pdo->lastInsertId();
         session_regenerate_id(true);
         $_SESSION['user_id'] = $userId;
+        logSessionEvent('registration_success');
         respond(['message' => 'Conta criada! Sua aventura começa agora.']);
     }
 
@@ -1014,6 +947,7 @@ try {
         }
         session_regenerate_id(true);
         $_SESSION['user_id'] = (int) $user['id'];
+        logSessionEvent('login_success');
         respond(['message' => 'Que bom ter você de volta!']);
     }
 
@@ -1022,6 +956,7 @@ try {
         requireCsrf();
         $_SESSION = [];
         session_destroy();
+        logSessionEvent('logout');
         respond(['message' => 'Você saiu da sua conta.']);
     }
 
@@ -1324,5 +1259,13 @@ try {
         $pdo->rollBack();
     }
     error_log((string) $exception);
+    if ($exception instanceof PDOException) {
+        logSessionEvent('database_error', [
+            'sql_state' => (string) ($exception->errorInfo[0] ?? $exception->getCode()),
+            'driver_code' => $exception->errorInfo[1] ?? null,
+            'driver_message' => (string) ($exception->errorInfo[2] ?? ''),
+        ]);
+        respond(['error' => 'Não foi possível acessar os dados. Confira as credenciais do MySQL e se o arquivo banco.sql foi importado no banco configurado.'], 500);
+    }
     respond(['error' => 'Ocorreu um erro inesperado. Tente novamente.'], 500);
 }
