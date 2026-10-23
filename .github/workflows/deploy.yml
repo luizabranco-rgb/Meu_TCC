@@ -1,0 +1,36 @@
+name: Deploy via FTP
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    name: Publicar no servidor
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Baixar o código do repositório
+        uses: actions/checkout@v4
+
+      - name: Substituir variaveis de ambiente no config.php
+        run: |
+          sed -i "s/__DB_HOST__/${{ secrets.DB_HOST }}/g" config.php
+          sed -i "s/__DB_NAME__/${{ secrets.DB_NAME }}/g" config.php
+          sed -i "s/__DB_USER__/${{ secrets.DB_USER }}/g" config.php
+          sed -i "s/__DB_PASS__/${{ secrets.DB_PASS }}/g" config.php
+
+      - name: Publicar via FTP
+        uses: SamKirkland/FTP-Deploy-Action@v4.3.5
+        with:
+          server: ${{ secrets.FTP_SERVER }}
+          username: ${{ secrets.FTP_USERNAME }}
+          password: ${{ secrets.FTP_PASSWORD }}
+          local-dir: ./
+          server-dir: /htdocs/
+          exclude: |
+            **/.git*
+            **/.git*/**
+            **/.github/**
+            **/database/**
